@@ -303,6 +303,17 @@ def list_ledger_entries(db_path: Path | None = None, limit: int = 50) -> list[di
         return [dict(r) for r in rows]
 
 
+def get_latest_session_entry(session_id: str, db_path: Path | None = None) -> dict[str, Any] | None:
+    """Return a receipt for this voice session only, not the latest global entry."""
+    prefix = session_id + ":"
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM ledger_entries WHERE substr(session_id, 1, ?) = ? ORDER BY id DESC LIMIT 1",
+            (len(prefix), prefix),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def get_last_reversible_entry(db_path: Path | None = None) -> dict[str, Any] | None:
     """Return the most recent non-reversal, unreversed ledger entry."""
     with get_connection(db_path) as conn:

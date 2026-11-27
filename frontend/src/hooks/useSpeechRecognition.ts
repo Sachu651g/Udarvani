@@ -141,7 +141,6 @@ export function useSpeechRecognition({
   const voiceSessionActiveRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const noSpeechCountRef = useRef(0);
-  const lastFinalRef = useRef<{ text: string; ts: number }>({ text: '', ts: 0 });
   const onFinalRef = useRef(onFinalTranscript);
   onFinalRef.current = onFinalTranscript;
 
@@ -150,8 +149,10 @@ export function useSpeechRecognition({
     setSessionActive(false);
     noSpeechCountRef.current = 0;
     if (recognitionRef.current) {
+      const recognition = recognitionRef.current;
+      recognitionRef.current = null;
       try {
-        recognitionRef.current.stop();
+        recognition.abort();
       } catch {
         // Ignore stop errors
       }
@@ -210,7 +211,9 @@ export function useSpeechRecognition({
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
 
+    let deliveredFinal = false;
     recognition.onstart = () => {
+      if (recognitionRef.current !== recognition || !voiceSessionActiveRef.current) return;
       setIsListening(true);
       setInterimText('');
       setErrorKind(null);
@@ -218,7 +221,7 @@ export function useSpeechRecognition({
     };
 
     recognition.onresult = (event: SpeechRecognitionEventLike) => {
-      if (isSpeakingRef.current) return;
+      if (recognitionRef.current !== recognition || !voiceSessionActiveRef.current || isSpeakingRef.current || deliveredFinal) return;
       noSpeechCountRef.current = 0;
       let interim = '';
       let finalChunk = '';
@@ -236,14 +239,7 @@ export function useSpeechRecognition({
       }
       const cleaned = finalChunk.trim();
       if (cleaned) {
-        const now = Date.now();
-        if (
-          cleaned === lastFinalRef.current.text &&
-          now - lastFinalRef.current.ts < 1500
-        ) {
-          return;
-        }
-        lastFinalRef.current = { text: cleaned, ts: now };
+        deliveredFinal = true;
         setFailureCount(0);
         setInterimText('');
         onFinalRef.current(cleaned);
@@ -251,6 +247,7 @@ export function useSpeechRecognition({
     };
 
     recognition.onerror = (event: SpeechRecognitionErrorEventLike) => {
+      if (recognitionRef.current !== recognition || !voiceSessionActiveRef.current || isSpeakingRef.current) return;
       setIsListening(false);
       setInterimText('');
       if (event.error === 'aborted') {
@@ -307,7 +304,7 @@ export function useSpeechRecognition({
     };
 
     recognition.onend = () => {
-      setIsListening(false);
+      if (recognitionRef.current === recognition) setIsListening(false);
     };
 
     recognitionRef.current = recognition;

@@ -73,6 +73,9 @@ export function App() {
   const [workflow, setWorkflow] = useState<WorkflowResponse | null>(null);
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
   const [ledgerEntries, setLedgerEntries] = useState<LedgerEntry[]>([]);
+  const [historyMode, setHistoryMode] = useState<'all' | 'cash' | 'upi' | 'credit' | 'repayment'>('all');
+  const [historySearch, setHistorySearch] = useState('');
+  const [historyExpanded, setHistoryExpanded] = useState(false);
   const [dailySummary, setDailySummary] = useState<DailySummary | null>(null);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [customerSearch, setCustomerSearch] = useState('');
@@ -85,6 +88,8 @@ export function App() {
   const [manualCustomerId, setManualCustomerId] = useState<string>('');
   const [manualAmount, setManualAmount] = useState('');
   const [manualPromisedDate, setManualPromisedDate] = useState('');
+  const [manualReviewed, setManualReviewed] = useState(false);
+  const manualInFlightRef = useRef(false);
 
   // Reminder & optional UPI settings
   const [reminderPreview, setReminderPreview] = useState<ReminderPreview | null>(null);
@@ -99,6 +104,7 @@ export function App() {
 
   const lastSpokenKeyRef = useRef<string>('');
   const confirmInFlightRef = useRef(false);
+  const transcriptInFlightRef = useRef(false);
 
   const refreshAllData = useCallback(async () => {
     const [ledgerRes, custRes, summaryRes, restockRes] = await Promise.all([
@@ -165,21 +171,28 @@ export function App() {
   );
 
   const handleTranscriptSubmit = useCallback(
-    async (text: string) => {
+    async (text: string, balanceChoice = false) => {
       const cleaned = text.trim();
-      if (!cleaned) return;
+      if (!cleaned || transcriptInFlightRef.current || confirmInFlightRef.current) return;
+      const isSimpleName = /^[\p{L}\p{M}][\p{L}\p{M} .'-]{0,60}$/u.test(cleaned)
+        && cleaned.split(/\s+/).length <= 4;
+      const request = balanceChoice || (queryResult?.kind === 'balance_ambiguous' && isSimpleName)
+        ? `balance for ${cleaned}`
+        : cleaned;
+      transcriptInFlightRef.current = true;
       setBusy(true);
       setApiError('');
       setSaveFailed(false);
       setStatusNotice('');
       try {
-        const res = await processVoiceTranscript(sessionId, cleaned);
+        const res = await processVoiceTranscript(sessionId, request);
         if (res.end_voice_session) {
           speech.endSession();
         }
         if (res.query_result) {
           setQueryResult(res.query_result);
           if (res.readback_text) {
+            lastSpokenKeyRef.current = '';
             speakOnce(
               res.readback_text,
               `query:${res.query_result.kind}:${res.readback_text}`,
@@ -196,7 +209,12 @@ export function App() {
         await refreshAllData();
         if (res.readback_text) {
           const key = `${res.draft?.status ?? 'none'}:${res.draft?.clarification_field ?? ''}:${res.readback_text}`;
-          speakOnce(res.readback_text, key, Boolean(res.end_voice_session));
+          if (lastSpokenKeyRef.current === key && !res.end_voice_session) {
+            // Don't repeat the same prompt or leave an active turn with a dead mic.
+            speech.finishPlayback();
+          } else {
+            speakOnce(res.readback_text, key, Boolean(res.end_voice_session));
+          }
         }
         if (res.message) {
           setStatusNotice(res.message);
@@ -206,10 +224,11 @@ export function App() {
           err instanceof Error ? err.message : 'Failed to process transcript.',
         );
       } finally {
+        transcriptInFlightRef.current = false;
         setBusy(false);
       }
     },
-    [refreshAllData, sessionId, speakOnce, speech],
+    [queryResult?.kind, refreshAllData, sessionId, speakOnce, speech],
   );
 
   const handleSelectCustomer = async (customerId: number) => {
@@ -231,7 +250,7 @@ export function App() {
   };
 
   const handleConfirm = async () => {
-    if (confirmInFlightRef.current) return;
+    if (confirmInFlightRef.current || transcriptInFlightRef.current) return;
     confirmInFlightRef.current = true;
     setBusy(true);
     setApiError('');
@@ -287,8 +306,14 @@ export function App() {
 
   const handleManualSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    if (manualInFlightRef.current || busy) return;
     const amt = Number(manualAmount);
     if (!amt || amt <= 0) return;
+    if (!manualReviewed) {
+      setManualReviewed(true);
+      return;
+    }
+    manualInFlightRef.current = true;
     setBusy(true);
     setApiError('');
     try {
@@ -298,6 +323,7 @@ export function App() {
         amount: amt,
         promised_date: manualPromisedDate || null,
       });
+      setManualReviewed(false);
       setManualAmount('');
       setManualPromisedDate('');
       setStatusNotice(`Manual ${manualMode.toUpperCase()} ₹${amt} recorded.`);
@@ -305,6 +331,7 @@ export function App() {
     } catch (err) {
       setApiError(err instanceof Error ? err.message : 'Manual save failed.');
     } finally {
+      manualInFlightRef.current = false;
       setBusy(false);
     }
   };
@@ -320,21 +347,35 @@ export function App() {
 
   const handleSaveSettings = async (e: FormEvent) => {
     e.preventDefault();
-    const saved = await saveSettings(merchantUpiId);
-    setMerchantUpiId(saved.merchant_upi_id);
-    setShowSettings(false);
-    if (reminderPreview) {
-      await handleOpenReminder(reminderPreview.customer.id);
+    try {
+      const saved = await saveSettings(merchantUpiId);
+      setMerchantUpiId(saved.merchant_upi_id);
+      setShowSettings(false);
+      if (reminderPreview) await handleOpenReminder(reminderPreview.customer.id);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Could not save UPI settings.');
     }
   };
 
   const handleAddRestock = async (e: FormEvent) => {
     e.preventDefault();
     if (!newRestockText.trim()) return;
-    await addRestockItem(newRestockText.trim());
-    setNewRestockText('');
-    const r = await fetchRestock();
-    setRestockItems(r.items);
+    try {
+      await addRestockItem(newRestockText.trim());
+      setNewRestockText('');
+      setRestockItems((await fetchRestock()).items);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Could not add the restock item.');
+    }
+  };
+
+  const handleToggleRestock = async (id: number) => {
+    try {
+      await toggleRestockItem(id);
+      setRestockItems((await fetchRestock()).items);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'Could not update the restock item.');
+    }
   };
 
   const handleFormSubmit = (e: FormEvent) => {
@@ -380,6 +421,13 @@ export function App() {
     );
   }, [customers, customerSearch]);
 
+  const filteredHistory = ledgerEntries.filter((entry) => {
+    const mode = entry.entry_type === 'repayment' ? 'repayment' : entry.payment_mode;
+    const q = historySearch.trim().toLowerCase();
+    return (historyMode === 'all' || historyMode === mode)
+      && (!q || `${entry.customer_name} ${entry.item_name}`.toLowerCase().includes(q));
+  });
+  const visibleHistory = historyExpanded ? filteredHistory : filteredHistory.slice(0, 8);
   const draft = workflow?.draft ?? null;
   const candidates = workflow?.candidate_customers ?? [];
   const isDuplicateCustomerClarification =
@@ -495,7 +543,7 @@ export function App() {
                     ? speech.stopListening
                     : speech.startListening
                 }
-                disabled={!speech.isSupported || busy}
+                disabled={!speech.isSupported || busy || speech.isSpeaking}
                 data-testid="mic-button"
               >
                 <span className="mic-icon" aria-hidden="true">
@@ -620,7 +668,7 @@ export function App() {
             </form>
 
             {showManualForm && (
-              <form className="manual-form" onSubmit={handleManualSubmit} data-testid="manual-form">
+              <form className="manual-form" onChange={() => setManualReviewed(false)} onSubmit={handleManualSubmit} data-testid="manual-form">
                 <div className="manual-grid">
                   <select
                     className="text-input"
@@ -641,6 +689,7 @@ export function App() {
                     min="1"
                     className="text-input"
                     placeholder="Amount ₹"
+                    aria-label="Manual amount in rupees"
                     value={manualAmount}
                     onChange={(e) => setManualAmount(e.target.value)}
                     required
@@ -673,9 +722,22 @@ export function App() {
                     )}
                   </div>
                 )}
+                {manualReviewed && (
+                  <p className="manual-review" role="status">
+                    Review: {manualMode.toUpperCase()} · {formatInr(Number(manualAmount))}
+                    {(manualMode === 'credit' || manualMode === 'repayment') &&
+                      ` · ${customers.find((c) => c.id === Number(manualCustomerId))?.name ?? 'Unknown customer'}`}
+                    {manualMode === 'credit' && manualPromisedDate && ` · Due ${manualPromisedDate}`}
+                  </p>
+                )}
                 <button type="submit" className="btn-primary" disabled={busy}>
-                  Record Manual Entry
+                  {manualReviewed ? 'Confirm & Record' : 'Review Manual Entry'}
                 </button>
+                {manualReviewed && (
+                  <button type="button" className="btn-secondary" onClick={() => setManualReviewed(false)}>
+                    Back to edit
+                  </button>
+                )}
               </form>
             )}
           </div>
@@ -711,6 +773,12 @@ export function App() {
                 <p className="advisor-note">{queryResult.advisor_note}</p>
               )}
               <p className="query-note">{queryResult.note}</p>
+              {queryResult.kind === 'balance_ambiguous' && queryResult.candidates?.map((customer) => (
+                <button type="button" key={customer.id} className="balance-choice"
+                  onClick={() => void handleTranscriptSubmit(customer.name, true)} disabled={busy}>
+                  {customer.name} · {customer.label}
+                </button>
+              ))}
 
               {queryResult.overdue_customers && queryResult.overdue_customers.length > 0 && (
                 <div className="overdue-box">
@@ -1051,17 +1119,30 @@ export function App() {
             <div className="ledger-header">
               <div>
                 <span className="section-eyebrow">3. Confirmed Ledger</span>
-                <h2 className="card-title">Recent Entries</h2>
+                <h2 className="card-title">Transaction history</h2>
               </div>
             </div>
 
-            {ledgerEntries.length === 0 ? (
+            <div className="history-controls" role="group" aria-label="Filter transaction history">
+              <input className="text-input" type="search" placeholder="Find customer or item"
+                aria-label="Search transaction history" value={historySearch}
+                onChange={(e) => { setHistorySearch(e.target.value); setHistoryExpanded(false); }} />
+              <select className="text-input" aria-label="Filter history by payment type" value={historyMode}
+                onChange={(e) => { setHistoryMode(e.target.value as typeof historyMode); setHistoryExpanded(false); }}>
+                <option value="all">All transactions</option>
+                <option value="cash">Cash</option>
+                <option value="upi">UPI</option>
+                <option value="credit">Credit</option>
+                <option value="repayment">Repayment</option>
+              </select>
+            </div>
+            {filteredHistory.length === 0 ? (
               <p className="empty-desc">
-                No confirmed entries yet. Speak or add a manual entry to record it here.
+                {ledgerEntries.length ? 'No transactions match these filters.' : 'No confirmed entries yet. Speak or add a manual entry to get started.'}
               </p>
             ) : (
               <ul className="ledger-list" data-testid="ledger-list">
-                {ledgerEntries.map((entry) => (
+                {visibleHistory.map((entry) => (
                   <li
                     key={entry.id}
                     className={`ledger-item ${entry.entry_type === 'reversal' ? 'ledger-reversal' : entry.entry_type === 'repayment' ? 'ledger-repayment' : ''}`}
@@ -1094,6 +1175,12 @@ export function App() {
                   </li>
                 ))}
               </ul>
+            )}
+            {filteredHistory.length > 8 && (
+              <button type="button" className="btn-secondary history-more" aria-expanded={historyExpanded}
+                onClick={() => setHistoryExpanded((value) => !value)}>
+                {historyExpanded ? 'Show recent 8' : `Show all ${filteredHistory.length} matches`}
+              </button>
             )}
           </div>
 
@@ -1154,11 +1241,7 @@ export function App() {
                       <input
                         type="checkbox"
                         checked={Boolean(it.done)}
-                        onChange={() =>
-                          void toggleRestockItem(it.id).then(() =>
-                            fetchRestock().then((r) => setRestockItems(r.items)),
-                          )
-                        }
+                        onChange={() => void handleToggleRestock(it.id)}
                       />{' '}
                       {it.item_name}
                     </label>

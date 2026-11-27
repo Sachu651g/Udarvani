@@ -155,9 +155,7 @@ def _strip_punct(text: str) -> str:
 
 def is_confirm_intent(text: str) -> bool:
     norm = re.sub(r"\s+", " ", _strip_punct(normalize_text(text).lower()))
-    if norm in CONFIRM_PHRASES:
-        return True
-    return any(norm.startswith(f"{p} ") or norm.endswith(f" {p}") for p in CONFIRM_PHRASES if len(p) >= 3)
+    return norm in CONFIRM_PHRASES or norm in {"हाँ सही है", "हां सही है", "haan sahi hai", "yes save", "हाँ सेव करो", "हाँ सेव कर दो", "सही है"}
 
 
 def is_decline_intent(text: str) -> bool:
@@ -174,17 +172,21 @@ def is_cancel_intent(text: str) -> bool:
 
 def _is_today_query(text: str) -> bool:
     norm = _strip_punct(normalize_text(text).lower())
-    if any(p in norm for p in ("evening summary", "shaam ka hisab", "शाम का हिसाब", "daily summary")):
+    if norm in {"aaj ka hisab", "aaj ka hisaab", "आज का हिसाब", "daily summary", "evening summary", "शाम का हिसाब"}:
         return True
-    today_markers = ("आज", "aaj", "today")
-    credit_markers = ("उधार", "udhaar", "udhar", "credit", "कुल", "kitna", "कितना", "total", "sale", "बिक्री")
-    return any(t in norm for t in today_markers) and any(c in norm for c in credit_markers)
+    return bool(
+        re.search(r"(?:^|\s)(?:आज|aaj|today)(?=\s|$)", norm)
+        and re.search(r"(?:^|\s)(?:कुल|कितना|कितनी|कितने|total|kitna|kitni|kitne|how much)(?=\s|$)", norm)
+        and re.search(r"(?:^|\s)(?:बिक्री|उधार|sale|sales|credit|udhaar|udhar|कुल|total)(?=\s|$)", norm)
+    )
 
 
 def _is_balance_query(text: str) -> bool:
     norm = _strip_punct(normalize_text(text).lower())
-    bal_markers = ("बकाया", "बाकी", "bakaya", "baaki", "baki", "balance", "hisab", "हिसाब")
-    return any(b in norm for b in bal_markers)
+    has_balance = re.search(r"(?:^|\s)(?:बकाया|बाकी|bakaya|baaki|baki|balance|hisab|hisaab|हिसाब)(?=\s|$)", norm)
+    has_question = re.search(r"(?:^|\s)(?:कितना|कितनी|कितने|kitna|kitni|kitne|how much)(?=\s|$)", norm)
+    has_credit = re.search(r"(?:^|\s)(?:उधार|udhaar|udhar|credit)(?=\s|$)", norm)
+    return bool(has_balance or (has_question and has_credit))
 
 
 def _is_reversal_request(text: str) -> bool:
@@ -228,7 +230,7 @@ def extract_numbers_with_positions(segment: str) -> list[tuple[float, int, int, 
         tok, s_pos, e_pos = tokens[i]
 
         # Numeric literal
-        if re.fullmatch(r"\d+(?:\.\d+)?", tok):
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", tok):
             val = float(tok)
             # Check e.g. "2 sau"
             if i + 1 < len(tokens) and tokens[i + 1][0] in HUNDRED_WORDS:
@@ -442,11 +444,12 @@ def _extract_customer_phrase(text: str, customers: list[dict[str, Any]]) -> tupl
     Returns (customer_query, is_explicit_prefix). Supports both stored and new names.
     """
     norm = _strip_punct(normalize_text(text))
+    norm = re.sub(r"^(?:(?:आज|aaj|today|please|कृपया)\s+)+", "", norm, flags=re.IGNORECASE)
     norm_l = norm.lower()
 
     # 1. Explicit "<name> ne/ko/ke khate/ke liye" prefix (use lookahead for whitespace/end so Devanagari vowel signs match)
     m = re.match(
-        r"^(.+?)\s+(?:ke\s+khate|ka\s+khata|ke\s+liye|ko|ne|के\s+खाते|का\s+खाता|का|के\s+लिए|को|ने)(?=\s|$)",
+        r"^(.+?)\s+(?:ke\s+khate|ka\s+khata|ke\s+liye|ka|ko|ne|के\s+खाते|का\s+खाता|का|के\s+लिए|को|ने)(?=\s|$)",
         norm,
         flags=re.IGNORECASE,
     )
@@ -510,7 +513,7 @@ def _extract_item_name(
     cleaned = normalize_text(text)
 
     cleaned = re.sub(
-        r"^.+?(?:ke\s+khate\s+mein|ke\s+khate\s+me|ka\s+khata|ke\s+liye|ko|ne|के\s+खाते\s+में|का\s+खाता|के\s+लिए|को|ने)\b",
+        r"^.+?(?:ke\s+khate\s+mein|ke\s+khate\s+me|ka\s+khata|ke\s+liye|ka|ko|ne|के\s+खाते\s+में|का\s+खाता|के\s+लिए|को|ने)\b",
         " ",
         cleaned,
         flags=re.IGNORECASE,
@@ -566,7 +569,7 @@ def is_new_transaction_utterance(parsed: ParseResult) -> bool:
     """Return True if `parsed` represents a brand-new standalone transaction rather than a short reply."""
     if parsed.intent != "upsert":
         return False
-    has_amount_or_item = (parsed.amount is not None) or (parsed.item_name is not None) or (parsed.quantity is not None)
+    has_amount_or_item = (parsed.entry_type == "direct_credit" and parsed.is_explicit_customer_phrase) or (parsed.amount is not None) or (parsed.item_name is not None) or (parsed.quantity is not None)
     has_actor_or_mode = (parsed.customer_query is not None) or (parsed.payment_mode in {"cash", "upi"}) or (parsed.entry_type == "repayment")
     return has_amount_or_item and has_actor_or_mode
 
@@ -583,11 +586,16 @@ def parse_utterance(
         return ParseResult(intent="upsert")
 
     # 1. Read-only queries & utility commands ALWAYS classify first
+    explicit_balance = re.match(r"^(?:balance for|balance of)\s+(.+?)[?।]*$", raw, re.I)
+    if explicit_balance:
+        return ParseResult(intent="query_customer_balance", customer_query=explicit_balance.group(1))
+    cust_q, _ = _extract_customer_phrase(normalize_text(raw), customers)
+    if _is_balance_query(raw) and cust_q and cust_q.lower() not in {"what", "how much", "आज", "today"}:
+        return ParseResult(intent="query_customer_balance", customer_query=cust_q)
     if _is_today_query(raw):
         return ParseResult(intent="query_today_total")
     if _is_balance_query(raw):
-        cust_q, _ = _extract_customer_phrase(normalize_text(raw), customers)
-        return ParseResult(intent="query_customer_balance", customer_query=cust_q)
+        return ParseResult(intent="query_customer_balance")
     if _is_reversal_request(raw):
         return ParseResult(intent="reverse_last")
 
@@ -611,6 +619,8 @@ def parse_utterance(
 
     # 3. Parse full utterance first so a new transaction is NEVER swallowed as a short reply
     normalized = normalize_text(raw)
+    if re.match(r"^(?:क्या|कौन|कितना|कितनी|कितने|what|how many|how much|kitna|kitni|kitne)(?=\s|$)", normalized.lower()):
+        return ParseResult(intent="clarify_question")
     customer_query, is_explicit_prefix = _extract_customer_phrase(normalized, customers)
     unit_label = _extract_unit_label(normalized)
     payment_mode = _detect_payment_mode(normalized)
@@ -619,11 +629,16 @@ def parse_utterance(
     # Check if this is a full new transaction
     nums_all = extract_numbers_with_positions(normalized)
     looks_like_full_new_tx = (
-        (customer_query is not None and len(nums_all) >= 1)
+        (customer_query is not None and (bool(nums_all) or
+         (is_explicit_prefix and _is_direct_credit_or_total_utterance(normalized, unit_label))))
         or (payment_mode in {"cash", "upi"} and len(nums_all) >= 1)
     )
 
     # 4. Short replies for active clarification (only when NOT a full new transaction)
+    if current_draft and current_draft.get("status") == "awaiting_confirmation" and clar_field == "" and current_draft.get("entry_type") in {"direct_credit", "repayment"}:
+        if re.match(r"^(?:नहीं|नही|nahi|badlo|बदलो|amount|रकम|change)(?:\s|$)", normalized.lower()) and len(nums_all) == 1:
+            return ParseResult(intent="patch_field", amount=nums_all[0][0])
+
     if current_draft and current_draft.get("status") == "clarification_needed" and not looks_like_full_new_tx:
         if clar_field == "customer_choice" and len(current_draft.get("candidate_customer_ids", [])) > 1:
             cand_ids = set(current_draft["candidate_customer_ids"])
@@ -644,7 +659,7 @@ def parse_utterance(
 
         if clar_field == "customer":
             name_only = _strip_punct(normalized)
-            if name_only:
+            if name_only and not nums_all and len(name_only.split()) <= 4 and not re.search(r"उधार|udhaa?r|रुप|rupee|लिख|कितन|price|save", name_only, re.I):
                 return ParseResult(
                     intent="upsert",
                     customer_query=customer_query or name_only,
@@ -661,8 +676,15 @@ def parse_utterance(
                 )
             return ParseResult(intent="upsert", unclear_reply=True)
 
-        if clar_field in {"unit_price", "amount"} and nums_all:
-            val = nums_all[-1][0]
+        if clar_field in {"unit_price", "amount"}:
+            if len(nums_all) != 1 or not re.fullmatch(
+                r"(?:(?:amount|price|rate|रकम|दाम|नहीं|badlo)\s+)?(?:(?:rs|inr)\s+)?"
+                + re.escape(nums_all[0][3])
+                + r"(?:\s+(?:रुपये|रुपए|रुपया|rupaye|rupees|rs|inr|each|per unit))?[.!।]?",
+                normalized.lower(),
+            ):
+                return ParseResult(intent="upsert", unclear_reply=True)
+            val = nums_all[0][0]
             if clar_field == "amount":
                 return ParseResult(intent="patch_field", amount=val)
             return ParseResult(intent="patch_field", unit_price=val)
@@ -703,12 +725,20 @@ def parse_utterance(
 
     # 8. Direct credit ("रमेश ने तीस रुपये उधार लिए" or "Ramesh ne do sau pachaas ka samaan liya, Friday ko denge")
     if _is_direct_credit_or_total_utterance(normalized, unit_label):
-        amount = nums_all[-1][0] if nums_all else None
+        # A date day number is not the amount. Prefer the currency number; otherwise
+        # accept only one number per clause, with an explicit correction between clauses.
+        currency = r"\s*(?:रुपये|रुपए|रुपया|rupaye|rupees|rupee|rs|inr)(?=\s|$|[,.।])"
+        monetary = [n for n in nums_all if re.match(currency, normalized.lower()[n[2]:])
+                    or re.search(r"(?:^|\s)(?:rs|inr)\s*$", normalized.lower()[:n[1]])]
+        choice = monetary or nums_all
+        if len(choice) > 1 and len(_split_correction_clauses(normalized)) == 1:
+            choice = []
+        amount = choice[-1][0] if choice else None
         changed: list[dict[str, Any]] = []
         notes: list[str] = ["Direct credit (उधार)"]
-        if len(nums_all) > 1:
-            changed.append({"field": "amount", "from": nums_all[0][0], "to": amount})
-            notes.append(f"Amount corrected: ₹{_fmt_num(nums_all[0][0])} → ₹{_fmt_num(amount)}")
+        if len(choice) > 1:
+            changed.append({"field": "amount", "from": choice[0][0], "to": amount})
+            notes.append(f"Amount corrected: ₹{_fmt_num(choice[0][0])} → ₹{_fmt_num(amount)}")
         return ParseResult(
             intent="upsert",
             entry_type="direct_credit",

@@ -10,6 +10,7 @@ from . import db
 from .parser import (
     SHOP_TZ,
     ParseResult,
+    is_confirm_intent,
     is_new_transaction_utterance,
     match_customers,
     parse_utterance,
@@ -347,8 +348,8 @@ def process_voice_input(
     customers = db.list_customers(db_path)
     current = db.get_draft(session_id, db_path)
 
-    if current and current.get("status") in {"saved", "cancelled"}:
-        db.delete_draft(session_id, db_path)
+    terminal_draft = current if current and current.get("status") in {"saved", "cancelled"} else None
+    if terminal_draft:
         current = None
 
     parsed = parse_utterance(transcript, customers, current, now=now)
@@ -368,7 +369,7 @@ def process_voice_input(
             f"वापसी प्राप्त: ₹{_fmt_num(summary['repayments_total'])}।{overdue_speech}"
         )
         return build_state_response(
-            current,
+            current or terminal_draft,
             customers,
             readback_text=readback,
             message="Read-only daily summary.",
@@ -391,11 +392,13 @@ def process_voice_input(
     if parsed.intent == "query_customer_balance":
         if not parsed.customer_query:
             msg = "किस ग्राहक का बकाया देखना है? पूरा नाम बोलें।"
-            return build_state_response(current, customers, readback_text=msg, message=msg)
+            return build_state_response(current or terminal_draft, customers, readback_text=msg, message=msg,
+                                        query_result={"kind": "balance_ambiguous", "title": "Specify Customer for Balance", "note": msg})
         matches = match_customers(parsed.customer_query, customers)
         if len(matches) == 0:
             msg = f"‘{parsed.customer_query}’ नाम का कोई ग्राहक नहीं मिला।"
-            return build_state_response(current, customers, readback_text=msg, message=msg, end_voice_session=True)
+            return build_state_response(current or terminal_draft, customers, readback_text=msg, message=msg, end_voice_session=True,
+                                        query_result={"kind": "customer_balance", "title": msg, "note": msg})
         if len(matches) > 1:
             opts = " या ".join(f"{m['name']} ({m['label']})" for m in matches)
             msg = f"किस {parsed.customer_query} का बकाया देखना है? {opts}?"
@@ -419,7 +422,7 @@ def process_voice_input(
         cust_hi = _hindi_name(cust["name"])
         readback = f"{cust_hi} ({cust['label']}) का दर्ज बकाया {bal_str} रुपये है।"
         return build_state_response(
-            current,
+            current or terminal_draft,
             customers,
             readback_text=readback,
             message="Read-only customer balance.",
@@ -435,6 +438,17 @@ def process_voice_input(
                 "note": "Recorded balance only (repayments outside this app are not included).",
             },
         )
+
+    if parsed.intent == "clarify_question":
+        msg = "सवाल समझ नहीं आया। बकाया देखने के लिए ग्राहक का नाम और ‘कितना उधार है’ बोलें।"
+        return build_state_response(current or terminal_draft, customers, readback_text=msg, message=msg, end_voice_session=True,
+                                    query_result={"kind": "customer_balance", "title": "Question not understood", "note": msg})
+
+    # Read-only requests must not clear even a completed draft/receipt.
+    if terminal_draft:
+        if is_confirm_intent(transcript):
+            return build_state_response(terminal_draft, customers, message="No new draft to confirm.", end_voice_session=True)
+        db.delete_draft(session_id, db_path)
 
     # --- 2. Restock list addition ---
     if parsed.intent == "add_restock" and parsed.restock_item:
@@ -657,11 +671,10 @@ def confirm_draft(session_id: str, db_path: Path | None = None) -> dict[str, Any
         return process_voice_input(session_id, "हाँ", db_path)
 
     if current.get("status") == "saved":
-        entries = db.list_ledger_entries(db_path, limit=1)
         return build_state_response(
             current,
             customers,
-            last_saved_entry=entries[0] if entries else None,
+            last_saved_entry=db.get_latest_session_entry(session_id, db_path),
             readback_text="यह एंट्री पहले ही सेव हो चुकी है।",
             message="Already saved (duplicate confirmation ignored).",
             end_voice_session=True,

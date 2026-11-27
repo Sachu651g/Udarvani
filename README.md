@@ -13,7 +13,7 @@
 - **Spoken Corrections & Missing-Field Recovery**: Replaces previous values when corrected (`nahi`, `actually`, `नहीं`) and blocks confirmation if required fields (such as unit price) are missing.
 - **Readback & Explicit Confirmation**: Reads back customer, quantity, and total via browser `speechSynthesis` before saving. Cancelled or unconfirmed drafts **never** write to the ledger. Duplicate confirmations are idempotent.
 - **Browser Speech Recognition + Accessible Fallback**: Uses the Web Speech API (`SpeechRecognition` / `webkitSpeechRecognition`) with `hi-IN` and `en-IN` modes, detects unsupported browsers, denied mic permissions, and recognition errors, and provides a clearly labeled **Transcript Input** for testing and accessibility.
-- **Zero Secrets / Zero Paid APIs**: Runs 100% locally with FastAPI, SQLite, and React/TypeScript.
+- **Zero Secrets / Zero Paid APIs**: The application, parser and ledger run locally without API keys. The browser’s speech recognition may require connectivity; use transcript input if recognition is unavailable.
 
 ---
 
@@ -91,6 +91,13 @@ To keep original hackathon logic clearly separated from framework scaffolding an
 - **Tooling / Configuration**: `package.json`, `tsconfig.json`, `vite.config.ts`, `Dockerfile`s, `nginx.conf`, `docker-compose.yml`.
 
 ---
+
+## Voice checks for a clean run
+
+- With an incomplete transaction still on screen, say “राजु का कितना उधार है?” The app should return a balance result (or say that Raju is not in the ledger) without starting or modifying a transaction.
+- Say “आज राजु का तीस रुपये का उधार लिखो”. Approve replacing the unfinished draft if prompted, then approve adding Raju if needed. Check that the confirmation card shows ₹30, not an item quantity or unit price. Only confirm the entry once the details are correct.
+- After saving, verify one receipt and one new ₹30 row. Refresh, then ask “राजु का कितना उधार है?” again to check the persisted balance. A repeated “हाँ” alone must not create a second entry.
+- Run these checks using Chrome or Edge with a real microphone; backend transcript tests do not verify device recognition or speaker feedback.
 
 ## Verification & Test Results
 

@@ -161,3 +161,76 @@ def test_quantity_correction_and_reversal(test_db: Path) -> None:
         # Duplicate confirm does not reverse twice
         client.post("/api/draft/confirm", json={"session_id": "q2"})
         assert client.get("/api/ledger").json()["count"] == 2
+
+
+def test_balance_never_starts_or_changes_transaction(test_db: Path) -> None:
+    with TestClient(app) as client:
+        def voice(text: str, session: str = "read-only") -> dict:
+            return client.post("/api/voice/process", json={"session_id": session, "transcript": text}).json()
+
+        missing = voice("राजु का कितना उधार है?")
+        assert missing["query_result"]["kind"] == "customer_balance"
+        assert missing["draft"] is None
+        assert not db.list_ledger_entries(test_db)
+
+        draft = voice("Suresh ko 4 kilo chini")["draft"]
+        for utterance in ("अंकिता का कितना उधार बचा है?", "Ramesh ka kitna udhaar hai?", "balance for Ramesh Sharma", "कितनी बिक्री हुई?"):
+            result = voice(utterance)
+            assert result["query_result"]
+            assert result["draft"] == draft
+            assert db.get_draft("read-only", test_db) == draft
+        assert voice("balance for Ramesh Sharma")["query_result"]["customer"]["name"] == "Ramesh Sharma"
+        assert not db.list_ledger_entries(test_db)
+
+
+def test_money_and_new_customer_confirmations_are_separate(test_db: Path) -> None:
+    with TestClient(app) as client:
+        def voice(text: str, session: str = "safe-money") -> dict:
+            return client.post("/api/voice/process", json={"session_id": session, "transcript": text}).json()
+
+        voice("Suresh ko 4 kilo chini")
+        wrong = voice("तीस pcs stock 200 रुपये")
+        assert wrong["draft"]["clarification_field"] == "unit_price"
+        assert wrong["draft"]["unit_price"] is None
+        assert not db.list_ledger_entries(test_db)
+
+        pending = voice("आज राजु का तीस रुपये का उधार लिखो")
+        assert pending["draft"]["clarification_field"] == "confirm_replace"
+        assert voice("हाँ")["draft"]["clarification_field"] == "confirm_new_customer"
+        ready = voice("हाँ")
+        assert ready["draft"]["total_amount"] == 30
+        assert ready["draft"]["item_name"] is None
+        assert not db.list_ledger_entries(test_db)
+
+        unrelated = voice("हाँ कुछ और")
+        assert unrelated["last_saved_entry"] is None
+        result = voice("हाँ")
+        assert result["last_saved_entry"]["total_amount"] == 30
+        assert len(db.list_ledger_entries(test_db)) == 1
+        assert voice("हाँ")["last_saved_entry"] is None
+        assert voice("राजु का कितना उधार है?", "later")["query_result"]["total"] == 30
+        assert len(db.list_ledger_entries(test_db)) == 1
+
+
+def test_amount_explicit_marker_wins_and_ambiguous_numbers_do_not_save(test_db: Path) -> None:
+    with TestClient(app) as client:
+        def voice(text: str, session: str) -> dict:
+            return client.post("/api/voice/process", json={"session_id": session, "transcript": text}).json()
+        assert voice("Ramesh Kumar ne 30 rupees udhaar liye date 12", "with-date")["draft"]["total_amount"] == 30
+        result = voice("Ramesh Kumar ne 30 6000 udhaar liya", "ambiguous")
+        assert result["draft"]["clarification_field"] == "amount"
+        assert voice("हाँ", "ambiguous")["last_saved_entry"] is None
+        assert voice("तीस रुपये", "ambiguous")["draft"]["total_amount"] == 30
+        assert voice("amount 35", "ambiguous")["draft"]["total_amount"] == 35
+        assert voice("हाँ", "ambiguous")["last_saved_entry"]["total_amount"] == 35
+
+
+def test_duplicate_confirmation_returns_receipt_for_its_own_session(test_db: Path) -> None:
+    with TestClient(app) as client:
+        receipts = {}
+        for session, amount in (("first", 30), ("second", 200)):
+            client.post("/api/voice/process", json={"session_id": session, "transcript": f"{amount} cash"})
+            receipts[session] = client.post("/api/draft/confirm", json={"session_id": session}).json()["last_saved_entry"]["id"]
+        dupe = client.post("/api/draft/confirm", json={"session_id": "first"}).json()
+        assert dupe["last_saved_entry"]["id"] == receipts["first"]
+        assert len(db.list_ledger_entries(test_db)) == 2

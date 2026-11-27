@@ -942,3 +942,44 @@ body {
 .settings-bar {
   margin-bottom: 16px;
 }
+
+.balance-choice {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  margin-top: 0.5rem;
+  padding: 0.65rem 0.85rem;
+  border: 1px solid #126055;
+  border-radius: 0.6rem;
+  background: #e9f7f2;
+  color: #16433d;
+  font-weight: 700;
+  text-align: left;
+}
+
+.balance-choice:focus-visible {
+  outline: 3px solid #126055;
+  outline-offset: 2px;
+}
+
+/* Keep the counter workflow readable at arm's length on a small screen. */
+:root {
+  --bg: #f0f5f3;
+  --border: #d0ddd8;
+  --ink: #142924;
+  --ink-muted: #435d55;
+}
+.card { border-radius: 1rem; box-shadow: 0 6px 20px rgb(24 64 53 / 6%); }
+.mic-card { background: linear-gradient(165deg, #f2fcf8 0%, #fff 58%); }
+.mic-button { font-size: 1.15rem; min-height: 72px; }
+.history-controls { display: grid; gap: 0.55rem; grid-template-columns: minmax(0, 1fr) minmax(0, 8rem); margin: 0.5rem 0 1rem; }
+.history-controls > * { min-width: 0; width: 100%; min-height: 44px; }
+.history-more { margin-top: 0.75rem; }
+.manual-review { padding: 0.75rem; margin: 0; border-radius: 0.5rem; background: #e3f3ee; font-weight: 650; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #0b655d; outline-offset: 2px; }
+@media (max-width: 560px) {
+  .app-shell { padding: 0.65rem; }
+  .card { padding: 0.85rem; }
+  .chip-btn, .btn-compact { min-height: 44px; }
+  .history-controls { grid-template-columns: 1fr; }
+}
